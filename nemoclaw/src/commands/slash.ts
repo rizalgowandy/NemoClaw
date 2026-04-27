@@ -7,12 +7,20 @@
  * Supports subcommands:
  *   /nemoclaw status   - show sandbox/blueprint/inference state
  *   /nemoclaw eject    - rollback to host installation
+ *   /nemoclaw shields  - show shields status (read-only)
+ *   /nemoclaw config   - show sandbox config (read-only, redacted)
  *   /nemoclaw          - show help
  */
 
 import type { PluginCommandContext, PluginCommandResult, OpenClawPluginApi } from "../index.js";
 import { loadState } from "../blueprint/state.js";
-import { loadOnboardConfig } from "../onboard/config.js";
+import {
+  describeOnboardEndpoint,
+  describeOnboardProvider,
+  loadOnboardConfig,
+} from "../onboard/config.js";
+import { slashShieldsStatus } from "./shields-status.js";
+import { slashConfigShow } from "./config-show.js";
 
 export function handleSlashCommand(
   ctx: PluginCommandContext,
@@ -27,6 +35,10 @@ export function handleSlashCommand(
       return slashEject();
     case "onboard":
       return slashOnboard();
+    case "shields":
+      return slashShieldsStatus();
+    case "config":
+      return slashConfigShow();
     default:
       return slashHelp();
   }
@@ -41,15 +53,18 @@ function slashHelp(): PluginCommandResult {
       "",
       "Subcommands:",
       "  `status`  - Show sandbox, blueprint, and inference state",
+      "  `shields` - Show shields status (up/down, timeout, policy)",
+      "  `config`  - Show sandbox configuration (credentials redacted)",
       "  `eject`   - Show rollback instructions",
       "  `onboard` - Show onboarding status and instructions",
       "",
-      "For full management use the CLI:",
-      "  `openclaw nemoclaw status`",
-      "  `openclaw nemoclaw migrate`",
-      "  `openclaw nemoclaw launch`",
-      "  `openclaw nemoclaw connect`",
-      "  `openclaw nemoclaw eject --confirm`",
+      "For full management use the NemoClaw CLI:",
+      "  `nemoclaw <name> shields down|up|status`",
+      "  `nemoclaw <name> config get`",
+      "  `nemoclaw <name> status`",
+      "  `nemoclaw <name> connect`",
+      "  `nemoclaw <name> logs`",
+      "  `nemoclaw <name> destroy`",
     ].join("\n"),
   };
 }
@@ -59,7 +74,7 @@ function slashStatus(): PluginCommandResult {
 
   if (!state.lastAction) {
     return {
-      text: "**NemoClaw**: No operations performed yet. Run `openclaw nemoclaw launch` or `openclaw nemoclaw migrate` to get started.",
+      text: "**NemoClaw**: No operations performed yet. Run `nemoclaw onboard` to get started.",
     };
   }
 
@@ -77,6 +92,13 @@ function slashStatus(): PluginCommandResult {
     lines.push("", `Rollback snapshot: ${state.migrationSnapshot}`);
   }
 
+  if (state.lastRebuildAt) {
+    lines.push("", `Last rebuild: ${state.lastRebuildAt}`);
+    if (state.lastRebuildBackupPath) {
+      lines.push(`Rebuild backup: ${state.lastRebuildBackupPath}`);
+    }
+  }
+
   return { text: lines.join("\n") };
 }
 
@@ -87,14 +109,15 @@ function slashOnboard(): PluginCommandResult {
       text: [
         "**NemoClaw Onboard Status**",
         "",
-        `Endpoint: ${config.endpointType} (${config.endpointUrl})`,
+        `Endpoint: ${describeOnboardEndpoint(config)}`,
+        `Provider: ${describeOnboardProvider(config)}`,
         config.ncpPartner ? `NCP Partner: ${config.ncpPartner}` : null,
         `Model: ${config.model}`,
         `Credential: $${config.credentialEnv}`,
         `Profile: ${config.profile}`,
         `Onboarded: ${config.onboardedAt}`,
         "",
-        "To reconfigure, run: `openclaw nemoclaw onboard`",
+        "To reconfigure, run: `nemoclaw onboard`",
       ]
         .filter(Boolean)
         .join("\n"),
@@ -107,12 +130,7 @@ function slashOnboard(): PluginCommandResult {
       "No configuration found. Run the onboard command to set up inference:",
       "",
       "```",
-      "openclaw nemoclaw onboard",
-      "```",
-      "",
-      "Or non-interactively:",
-      "```",
-      'openclaw nemoclaw onboard --api-key "$NVIDIA_API_KEY" --endpoint build --model nvidia/nemotron-3-super-120b-a12b',
+      "nemoclaw onboard",
       "```",
     ].join("\n"),
   };
@@ -138,7 +156,7 @@ function slashEject(): PluginCommandResult {
       "To rollback to your host OpenClaw installation, run:",
       "",
       "```",
-      "openclaw nemoclaw eject --confirm",
+      "nemoclaw <name> destroy",
       "```",
       "",
       `Snapshot: ${state.migrationSnapshot ?? state.hostBackupPath ?? "none"}`,

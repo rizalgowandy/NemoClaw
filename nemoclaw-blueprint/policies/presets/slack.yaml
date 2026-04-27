@@ -3,7 +3,7 @@
 
 preset:
   name: slack
-  description: "Slack API and webhooks access"
+  description: "Slack API, Socket Mode, and webhooks access"
 
 network_policies:
   slack:
@@ -13,7 +13,6 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
@@ -21,7 +20,6 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
@@ -29,7 +27,21 @@ network_policies:
         port: 443
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow: { method: GET, path: "/**" }
           - allow: { method: POST, path: "/**" }
+      # Socket Mode WebSocket — pure L4 CONNECT tunnel. OpenShell v0.0.15+
+      # auto-terminates TLS unconditionally (NVIDIA/OpenShell#544), which
+      # also applies to WSS. tls: skip restores the pre-v0.0.15 pass-
+      # through behaviour needed here.
+      - host: wss-primary.slack.com
+        port: 443
+        access: full
+        tls: skip
+      - host: wss-backup.slack.com
+        port: 443
+        access: full
+        tls: skip
+    binaries:
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/node }
