@@ -1,8 +1,10 @@
 ---
 title:
-  page: "NemoClaw Network Policies — Baseline Rules and Operator Approval"
+  page: "NemoClaw Network Policies: Baseline Rules and Operator Approval"
   nav: "Network Policies"
-description: "Baseline network policy, filesystem rules, and operator approval flow."
+description:
+  main: "Baseline network policy, filesystem rules, and operator approval flow."
+  agent: "Covers the baseline network policy, filesystem rules, and operator approval flow. Use when looking up a specific default endpoint, filesystem path, or the runtime approval sequence NemoClaw applies on blocked requests."
 keywords: ["nemoclaw network policy", "sandbox egress control operator approval"]
 topics: ["generative_ai", "ai_agents"]
 tags: ["openclaw", "openshell", "sandboxing", "network_policy", "security"]
@@ -20,7 +22,7 @@ status: published
 
 # Network Policies
 
-NemoClaw runs with a strict-by-default network policy.
+NemoClaw runs with a deny-by-default network policy.
 The sandbox can only reach endpoints that are explicitly allowed.
 Any request to an unlisted destination is intercepted by OpenShell, and the operator is prompted to approve or deny it in real time through the TUI.
 
@@ -51,34 +53,19 @@ The following endpoint groups are allowed by default:
   - Binaries
   - Rules
 
-* - `claude_code`
-  - `api.anthropic.com:443`, `statsig.anthropic.com:443`, `sentry.io:443`
-  - `/usr/local/bin/claude`
-  - All methods
-
 * - `nvidia`
   - `integrate.api.nvidia.com:443`, `inference-api.nvidia.com:443`
-  - `/usr/local/bin/claude`, `/usr/local/bin/openclaw`
-  - All methods
-
-* - `github`
-  - `github.com:443`
-  - `/usr/bin/gh`, `/usr/bin/git`
-  - All methods, all paths
-
-* - `github_rest_api`
-  - `api.github.com:443`
-  - `/usr/bin/gh`
-  - GET, POST, PATCH, PUT, DELETE
+  - `/usr/local/bin/openclaw`
+  - POST to inference and embedding paths, GET to model listings
 
 * - `clawhub`
-  - `clawhub.com:443`
-  - `/usr/local/bin/openclaw`
+  - `clawhub.ai:443`
+  - `/usr/local/bin/openclaw`, `/usr/local/bin/node`
   - GET, POST
 
 * - `openclaw_api`
   - `openclaw.ai:443`
-  - `/usr/local/bin/openclaw`
+  - `/usr/local/bin/openclaw`, `/usr/local/bin/node`
   - GET, POST
 
 * - `openclaw_docs`
@@ -88,17 +75,44 @@ The following endpoint groups are allowed by default:
 
 * - `npm_registry`
   - `registry.npmjs.org:443`
-  - `/usr/local/bin/openclaw`, `/usr/local/bin/npm`
+  - `/usr/local/bin/openclaw` only (openclaw plugins install)
   - GET only
-
-* - `telegram`
-  - `api.telegram.org:443`
-  - Any binary
-  - GET, POST on `/bot*/**`
 
 :::
 
 All endpoints use TLS termination and are enforced at port 443.
+
+:::{note}
+GitHub access (`github.com`, `api.github.com`) is not included in the baseline policy.
+Apply the `github` preset during onboarding if your agent needs GitHub access.
+See [Customize the Network Policy](../network-policy/customize-network-policy.md).
+:::
+
+(policy-tiers)=
+
+## Policy Tiers
+
+During onboarding, the wizard prompts for a policy tier that determines the default set of presets applied on top of the baseline policy.
+The baseline policy is always applied regardless of the selected tier.
+
+| Tier | Presets included | Description |
+|------|------------------|-------------|
+| Restricted | None | Base sandbox only. No third-party network access beyond inference and core agent tooling. |
+| Balanced (default) | npm, pypi, huggingface, brew, brave | Full dev tooling and web search. No messaging platform access. |
+| Open | npm, pypi, huggingface, brew, brave, slack, discord, telegram, jira, outlook | Broad access across third-party services including messaging and productivity. |
+
+After selecting a tier, a combined preset and access-mode screen lets you include or exclude individual presets and toggle each between read (GET only) and read-write (GET + POST/PUT/PATCH) access.
+Tier-default presets are pre-selected; additional presets can be added from the full list.
+
+Tier definitions are stored in `nemoclaw-blueprint/policies/tiers.yaml`.
+
+In non-interactive mode, set the tier with `NEMOCLAW_POLICY_TIER`:
+
+```console
+$ NEMOCLAW_POLICY_TIER=open nemoclaw onboard --non-interactive --yes-i-accept-third-party-software
+```
+
+If the value does not match a known tier, onboarding exits with an error listing the valid options.
 
 ### Inference
 
@@ -138,5 +152,11 @@ $ nemoclaw onboard
 Apply policy updates to a running sandbox without restarting:
 
 ```console
-$ openshell policy set <policy-file>
+$ openshell policy update <sandbox-name> --add-endpoint api.example.com:443:read-only:rest:enforce
+```
+
+To replace the live policy with a complete raw policy file, use `openshell policy set`:
+
+```console
+$ openshell policy set --policy <policy-file> <sandbox-name>
 ```

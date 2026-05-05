@@ -11,10 +11,74 @@
  * time.
  */
 
-import type { Command } from "commander";
-import { registerCliCommands } from "./cli.js";
+import { execFileSync } from "node:child_process";
 import { handleSlashCommand } from "./commands/slash.js";
-import { loadOnboardConfig } from "./onboard/config.js";
+import {
+  describeOnboardEndpoint,
+  describeOnboardProvider,
+  loadOnboardConfig,
+} from "./onboard/config.js";
+import { registerRuntimeContext } from "./runtime-context.js";
+import { scanForSecrets, isMemoryPath } from "./security/secret-scanner.js";
+
+type PluginScalar = string | number | boolean | null | undefined;
+type PluginValue = PluginScalar | PluginRecord | PluginValue[];
+type PluginRecord = { [key: string]: PluginValue };
+
+function isToolParams(value: PluginValue | object | null | undefined): value is ToolParams {
+  return (
+    value !== null && value !== undefined && typeof value === "object" && !Array.isArray(value)
+  );
+}
+
+function readStringProperty(
+  value: PluginValue | object | null | undefined,
+  key: string,
+): string | undefined {
+  if (!isToolParams(value)) {
+    return undefined;
+  }
+  const property = value[key];
+  return typeof property === "string" ? property : undefined;
+}
+
+function readBeforeToolCallEvent(
+  value: PluginValue | object | null | undefined,
+): Partial<BeforeToolCallEvent> | undefined {
+  if (!isToolParams(value)) {
+    return undefined;
+  }
+  const params = value["params"];
+  return {
+    toolName: readStringProperty(value, "toolName"),
+    params: isToolParams(params) ? params : undefined,
+  };
+}
+
+// Resolve live inference config from OpenShell as a fallback when the
+// onboard config file is not available (e.g. when running inside the
+// sandbox). Returns empty strings if the probe fails.
+function probeOpenShellInference(): { endpoint: string; provider: string; model: string } {
+  try {
+    const raw = execFileSync("openshell", ["inference", "get", "--json"], {
+      encoding: "utf-8",
+      timeout: 3000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const parsed: unknown = JSON.parse(raw);
+    const parsedObject = typeof parsed === "object" && parsed !== null ? parsed : null;
+    const endpoint = readStringProperty(parsedObject, "endpoint");
+    const provider = readStringProperty(parsedObject, "provider");
+    const model = readStringProperty(parsedObject, "model");
+    return {
+      endpoint: endpoint ?? "",
+      provider: provider ?? "",
+      model: model ?? "",
+    };
+  } catch {
+    return { endpoint: "", provider: "", model: "" };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // OpenClaw Plugin SDK compatible types (mirrors openclaw/plugin-sdk)
@@ -22,7 +86,7 @@ import { loadOnboardConfig } from "./onboard/config.js";
 
 /** Subset of OpenClawConfig that we actually read. */
 export interface OpenClawConfig {
-  [key: string]: unknown;
+  [key: string]: PluginValue;
 }
 
 /** Logger provided by the plugin host. */
@@ -32,6 +96,8 @@ export interface PluginLogger {
   error(message: string): void;
   debug(message: string): void;
 }
+
+type ToolParams = { [key: string]: PluginValue };
 
 /** Context passed to slash-command handlers. */
 export interface PluginCommandContext {
@@ -61,17 +127,6 @@ export interface PluginCommandDefinition {
   requireAuth?: boolean;
   handler: (ctx: PluginCommandContext) => PluginCommandResult | Promise<PluginCommandResult>;
 }
-
-/** Context passed to the CLI registrar callback. */
-export interface PluginCliContext {
-  program: Command;
-  config: OpenClawConfig;
-  workspaceDir?: string;
-  logger: PluginLogger;
-}
-
-/** CLI registrar callback type. */
-export type PluginCliRegistrar = (ctx: PluginCliContext) => void | Promise<void>;
 
 /** Auth method for a provider plugin. */
 export interface ProviderAuthMethod {
@@ -113,6 +168,29 @@ export interface PluginService {
   stop?: (ctx: { config: OpenClawConfig; logger: PluginLogger }) => void | Promise<void>;
 }
 
+/** Event payload for before_tool_call hooks. */
+export interface BeforeToolCallEvent {
+  toolName: string;
+  params: ToolParams;
+  runId?: string;
+  toolCallId?: string;
+}
+
+/** Return value from a before_tool_call hook. */
+export interface BeforeToolCallResult {
+  params?: ToolParams;
+  block?: boolean;
+  blockReason?: string;
+}
+
+/** Return value from a before_agent_start hook. */
+export interface BeforeAgentStartResult {
+  prependContext?: string;
+}
+
+/** Union of all hook result types. */
+export type HookResult = BeforeToolCallResult | BeforeAgentStartResult | undefined;
+
 /**
  * The API object injected into the plugin's register function by the OpenClaw
  * host. Only the methods we actually call are listed here.
@@ -122,14 +200,16 @@ export interface OpenClawPluginApi {
   name: string;
   version?: string;
   config: OpenClawConfig;
-  pluginConfig?: Record<string, unknown>;
+  pluginConfig?: OpenClawConfig;
   logger: PluginLogger;
   registerCommand: (command: PluginCommandDefinition) => void;
-  registerCli: (registrar: PluginCliRegistrar, opts?: { commands?: string[] }) => void;
   registerProvider: (provider: ProviderPlugin) => void;
   registerService: (service: PluginService) => void;
   resolvePath: (input: string) => string;
-  on: (hookName: string, handler: (...args: unknown[]) => void) => void;
+  on: (
+    hookName: string,
+    handler: (...args: readonly PluginValue[]) => HookResult | Promise<HookResult>,
+  ) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +221,78 @@ export interface NemoClawConfig {
   blueprintRegistry: string;
   sandboxName: string;
   inferenceProvider: string;
+}
+
+function activeModelEntries(
+  onboardCfg: ReturnType<typeof loadOnboardConfig>,
+  fallbackModel = "",
+): ModelProviderEntry[] {
+  // Prefer fallbackModel (live gateway model) over the potentially stale onboard config (#2608).
+  const activeModel = fallbackModel || onboardCfg?.model || "";
+  if (!activeModel) {
+    return [
+      {
+        id: "nvidia/nemotron-3-super-120b-a12b",
+        label: "Nemotron 3 Super 120B (March 2026)",
+        contextWindow: 131072,
+        maxOutput: 8192,
+      },
+      {
+        id: "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+        label: "Nemotron Ultra 253B",
+        contextWindow: 131072,
+        maxOutput: 4096,
+      },
+      {
+        id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        label: "Nemotron Super 49B v1.5",
+        contextWindow: 131072,
+        maxOutput: 4096,
+      },
+      {
+        id: "nvidia/nemotron-3-nano-30b-a3b",
+        label: "Nemotron 3 Nano 30B",
+        contextWindow: 131072,
+        maxOutput: 4096,
+      },
+    ];
+  }
+
+  return [
+    {
+      id: `inference/${activeModel}`,
+      label: activeModel,
+      contextWindow: 131072,
+      maxOutput: 8192,
+    },
+  ];
+}
+
+function registeredProviderForConfig(
+  onboardCfg: ReturnType<typeof loadOnboardConfig>,
+  providerCredentialEnv: string,
+  fallbackModel = "",
+): ProviderPlugin {
+  const authLabel =
+    providerCredentialEnv === "NVIDIA_API_KEY"
+      ? `NVIDIA API Key (${providerCredentialEnv})`
+      : `OpenAI API Key (${providerCredentialEnv})`;
+
+  return {
+    id: "inference",
+    label: "Managed Inference Route",
+    aliases: ["inference-local", "nemoclaw"],
+    envVars: [providerCredentialEnv],
+    models: { chat: activeModelEntries(onboardCfg, fallbackModel) },
+    auth: [
+      {
+        type: "bearer",
+        envVar: providerCredentialEnv,
+        headerName: "Authorization",
+        label: authLabel,
+      },
+    ],
+  };
 }
 
 const DEFAULT_PLUGIN_CONFIG: NemoClawConfig = {
@@ -176,6 +328,9 @@ export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
+/** Tool names that can write/modify files and should be scanned for secrets. */
+const WRITE_TOOL_NAMES = new Set(["write", "edit", "apply_patch", "notebook_edit"]);
+
 export default function register(api: OpenClawPluginApi): void {
   // 1. Register /nemoclaw slash command (chat interface)
   api.registerCommand({
@@ -185,75 +340,96 @@ export default function register(api: OpenClawPluginApi): void {
     handler: (ctx) => handleSlashCommand(ctx, api),
   });
 
-  // 2. Register `openclaw nemoclaw` CLI subcommands (commander.js)
-  api.registerCli(
-    (cliCtx) => {
-      registerCliCommands(cliCtx, api);
-    },
-    { commands: ["nemoclaw"] },
+  // 2. Register nvidia-nim provider — always probe the live gateway inference
+  // state so the TUI footer reflects the current model after a runtime
+  // `openshell inference set` (#2608).
+  const onboardCfg = loadOnboardConfig();
+  const probed = probeOpenShellInference();
+
+  // 4. Register runtime context injection (sandbox-awareness hook)
+  const pluginConfig = getPluginConfig(api);
+  try {
+    registerRuntimeContext(api, pluginConfig);
+  } catch (err) {
+    api.logger.warn(
+      `Could not register runtime context hook: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  let bannerEndpoint = onboardCfg ? describeOnboardEndpoint(onboardCfg) : "";
+  let bannerProvider = onboardCfg ? describeOnboardProvider(onboardCfg) : "";
+  // Prefer the live gateway model over the stale onboard config model.
+  let bannerModel = probed.model || onboardCfg?.model || "";
+
+  if (!bannerEndpoint) bannerEndpoint = probed.endpoint;
+  if (!bannerProvider) bannerProvider = probed.provider;
+
+  if (!bannerEndpoint) bannerEndpoint = "build.nvidia.com";
+  if (!bannerProvider) bannerProvider = "NVIDIA Endpoints";
+  if (!bannerModel) bannerModel = "nvidia/nemotron-3-super-120b-a12b";
+
+  const providerCredentialEnv = onboardCfg?.credentialEnv ?? "NVIDIA_API_KEY";
+  api.registerProvider(
+    registeredProviderForConfig(onboardCfg, providerCredentialEnv, probed.model),
   );
 
-  // 3. Register nvidia-nim provider — use onboard config if available
-  const onboardCfg = loadOnboardConfig();
-  const providerCredentialEnv = onboardCfg?.credentialEnv ?? "NVIDIA_API_KEY";
-  const providerLabel = onboardCfg
-    ? `NVIDIA NIM (${onboardCfg.endpointType}${onboardCfg.ncpPartner ? ` - ${onboardCfg.ncpPartner}` : ""})`
-    : "NVIDIA NIM (build.nvidia.com)";
+  // 3. Register before_tool_call hook to block secrets in memory writes (#1233)
+  // NOTE: This relies on OpenClaw's before_tool_call plugin hook contract
+  // (PluginHookBeforeToolCallEvent/Result in openclaw/src/plugins/types.ts).
+  // If the hook name or return shape changes in a future OpenClaw release,
+  // the try/catch ensures the plugin still loads — the scanner just becomes
+  // a no-op. Verify after OpenClaw upgrades that blocked writes still show
+  // the expected error message.
+  try {
+    api.on(
+      "before_tool_call",
+      (...args: readonly PluginValue[]): BeforeToolCallResult | undefined => {
+        const event = readBeforeToolCallEvent(args[0]);
+        if (!event?.toolName || !event.params) return undefined;
 
-  api.registerProvider({
-    id: "nvidia-nim",
-    label: providerLabel,
-    docsPath: "https://build.nvidia.com/docs",
-    aliases: ["nvidia", "nim"],
-    envVars: [providerCredentialEnv],
-    models: {
-      chat: [
-        {
-          id: "nvidia/nemotron-3-super-120b-a12b",
-          label: "Nemotron 3 Super 120B (March 2026)",
-          contextWindow: 131072,
-          maxOutput: 8192,
-        },
-        {
-          id: "nvidia/llama-3.1-nemotron-ultra-253b-v1",
-          label: "Nemotron Ultra 253B",
-          contextWindow: 131072,
-          maxOutput: 4096,
-        },
-        {
-          id: "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-          label: "Nemotron Super 49B v1.5",
-          contextWindow: 131072,
-          maxOutput: 4096,
-        },
-        {
-          id: "nvidia/nemotron-3-nano-30b-a3b",
-          label: "Nemotron 3 Nano 30B",
-          contextWindow: 131072,
-          maxOutput: 4096,
-        },
-      ],
-    },
-    auth: [
-      {
-        type: "bearer",
-        envVar: providerCredentialEnv,
-        headerName: "Authorization",
-        label: `NVIDIA API Key (${providerCredentialEnv})`,
+        const toolName = event.toolName.toLowerCase();
+        if (!WRITE_TOOL_NAMES.has(toolName)) return undefined;
+
+        const rawPath = event.params["file_path"] ?? event.params["path"];
+        if (typeof rawPath !== "string" || rawPath.length === 0) return undefined;
+        // Resolve symlinks and traversal before checking — prevents bypasses like
+        // /sandbox/project/../../.openclaw/memory/secrets.md
+        const filePath = api.resolvePath(rawPath);
+        if (!isMemoryPath(filePath)) return undefined;
+
+        const content =
+          event.params["content"] ?? event.params["new_string"] ?? event.params["patch"];
+        if (typeof content !== "string" || content.length === 0) return undefined;
+
+        const matches = scanForSecrets(content);
+        if (matches.length === 0) return undefined;
+
+        const summary = matches.map((m) => `  - ${m.pattern} (${m.redacted})`).join("\n");
+        api.logger.warn(`[SECURITY] Blocked memory write to ${filePath} — secrets detected`);
+
+        return {
+          block: true,
+          blockReason:
+            `Memory write blocked: detected ${String(matches.length)} likely secret(s):\n${summary}\n\n` +
+            "Remove secrets before saving to persistent memory. " +
+            "Use environment variables or credential stores instead.",
+        };
       },
-    ],
-  });
-
-  const bannerEndpoint = onboardCfg?.endpointType ?? "build.nvidia.com";
-  const bannerModel = onboardCfg?.model ?? "nvidia/nemotron-3-super-120b-a12b";
+    );
+  } catch (err) {
+    api.logger.warn(
+      `[SECURITY] Could not register secret scanner hook: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
   api.logger.info("");
   api.logger.info("  ┌─────────────────────────────────────────────────────┐");
   api.logger.info("  │  NemoClaw registered                                │");
   api.logger.info("  │                                                     │");
   api.logger.info(`  │  Endpoint:  ${bannerEndpoint.padEnd(40)}│`);
+  api.logger.info(`  │  Provider:  ${bannerProvider.padEnd(40)}│`);
   api.logger.info(`  │  Model:     ${bannerModel.padEnd(40)}│`);
-  api.logger.info("  │  Commands:  openclaw nemoclaw <command>             │");
+  api.logger.info("  │  Slash:     /nemoclaw                               │");
   api.logger.info("  └─────────────────────────────────────────────────────┘");
   api.logger.info("");
 }
